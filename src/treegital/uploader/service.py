@@ -73,7 +73,9 @@ def clean_filename(filename):
        filename.split('.')[0].upper() in _windows_device_files:
         filename = '_' + filename
 
-    return unicode(filename, INNER_ENCODING).encode(INNER_ENCODING)
+    if not isinstance(filename, unicode):
+        filename = unicode(filename, INNER_ENCODING).encode(INNER_ENCODING)
+    return filename
 
 
 class ConfigParserManifest(object):
@@ -82,8 +84,12 @@ class ConfigParserManifest(object):
         self.dest = dest
         self.manifest = join(dest, name)
 
-    def write(self, *files):
+    def write(self, *files, **extra):
         config = ConfigParser.RawConfigParser()
+        config.add_section('DEFAULT')
+        for key, value in extra.items():
+            config.set('DEFAULT', key, value)
+
         for digest, filename in files:
             path = join(self.dest, digest)
             stats = os.stat(path)
@@ -108,6 +114,33 @@ class ConfigParserManifest(object):
         return data
 
 
+class JSONManifest(object):
+
+    def __init__(self, dest, name="MANIFEST"):
+        self.dest = dest
+        self.manifest = join(dest, name)
+
+    def write(self, *files, **extra):
+        config = {}
+        config['DEFAULT'] = extra
+        for digest, filename in files:
+            path = join(self.dest, digest)
+            stats = os.stat(path)
+            config[digest] = {            
+                'name': filename,
+                'size': stats[ST_SIZE],
+                'date': stats[ST_CTIME],
+                }
+            
+        with open(self.manifest, 'wb+') as fd:
+            json.dump(config, fd, indent=4)
+
+    def read(self):
+        with open(self.manifest, 'r') as fd:
+            data = json.load(fd)
+        return data
+
+    
 def create_file(path, name):
     filepath = join(path, name)
     try:
@@ -127,15 +160,26 @@ def create_directory(path):
         return None
 
 
-def persist_files(environ, destination):
+def persist_files(destination, *files):
     """Document me.
     """
+    # digest registry
+    digests = set()
+
+    for item in files:
+        digested = digest(item.file)
+        if digested not in digests:
+            digests.add(digested)
+            filename = clean_filename(item.filename)
+            path = join(destination, digested)
+            with open(path, 'w') as upload:
+                shutil.copyfileobj(item.file, upload)
+            yield (digested, filename)
+
+
+def extract_files(environ):
     fields = cgi.FieldStorage(
         fp=environ['wsgi.input'], environ=environ, keep_blank_values=1)    
-
-    # stored files on fs
-    files = set()
-    digests = set()
 
     for name in fields.keys():
         field = fields[name]
@@ -145,27 +189,23 @@ def persist_files(environ, destination):
 
         for item in field:
             if isinstance(item, cgi.FieldStorage) and item.filename:
-                digested = digest(item.file)
-                if digested not in digests:
-                    digests.add(digested)
-                    filename = clean_filename(item.filename)
-                    path = join(destination, digested)
-                    with open(path, 'w') as upload:
-                        shutil.copyfileobj(item.file, upload)
-                    files.add((digested, filename))
+                yield item
 
-    return files
+
+def extract_and_persist(environ, destination):
+    extracted = list(extract_files(environ))
+    return persist_files(destination, *extracted)
 
 
 class FilesystemHandler(object):
     """Document me.
     """
     ignore = set(('MANIFEST',))
-    
+
     def __init__(self, upload, namespace):
         self.__upload = upload
         self.namespace = namespace
-        
+
     @property
     def upload_root(self):
         return join(self.__upload, self.namespace)
@@ -176,28 +216,35 @@ class FilesystemHandler(object):
             if listed not in self.ignore:
                 yield listed
 
-    def upload(self, upload_node, environ):
+    def upload(self, upload_node, files):
+        with TemporaryDirectory() as tmpdirname:
+            uploaded = list(persist_files(tmpdirname, *files))
+            destination = join(self.upload_root, upload_node)
+            shutil.copytree(tmpdirname, destination)
+            return destination, uploaded
+
+    def extract_upload(self, upload_node, environ):
         """The heart of the handler.
         """
         with TemporaryDirectory() as tmpdirname:
-            files = persist_files(environ, tmpdirname)
+            uploaded = list(extract_and_persist(environ, tmpdirname))
             destination = join(self.upload_root, upload_node)
             shutil.copytree(tmpdirname, destination)
-            return destination, files
-    
+            return destination, uploaded
+
 
 class Uploader(object):
     """the uploading application
     """
-    def __init__(self, upload, namespace, atm=UUID_ATM):
+    def __init__(self, upload_root, namespace, atm=UUID_ATM):
         self.atm = atm
-        self.fs_handler = FilesystemHandler(upload, namespace)
+        self.fs_handler = FilesystemHandler(upload_root, namespace)
         self.mf_handler = ConfigParserManifest
 
     def __call__(self, environ, start_response):
         ticket = self.atm.generate()
         path = self.atm.get_path(ticket)
-        dest, files = self.fs_handler.upload(path, environ)
+        dest, files = self.fs_handler.extract_upload(path, environ)
         manifest = self.mf_handler(dest)
         manifest.write(*files)
         status = '200 OK'
